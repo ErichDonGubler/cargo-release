@@ -428,6 +428,68 @@ fn release_package(
         replacements.insert("{{next_version}}", updated_version_string.clone());
         if !dry_run {
             cargo::set_package_version(&pkg.manifest_path, &updated_version_string)?;
+            let mut dependents_failed = false;
+            for (dep_pkg, dep) in find_dependents(&ws_meta, &pkg.meta) {
+                match pkg.config.dependent_version() {
+                    config::DependentVersion::Ignore => (),
+                    config::DependentVersion::Warn => {
+                        if !dep.req.matches(&version) {
+                            shell::log_warn(&format!(
+                                "{}'s dependency on {} `{}` is incompatible with {}",
+                                dep_pkg.name, pkg.meta.name, dep.req, updated_version_string
+                            ));
+                        }
+                    }
+                    config::DependentVersion::Error => {
+                        if !dep.req.matches(&version) {
+                            shell::log_warn(&format!(
+                                "{}'s dependency on {} `{}` is incompatible with {}",
+                                dep_pkg.name, pkg.meta.name, dep.req, updated_version_string
+                            ));
+                            dependents_failed = true;
+                        }
+                    }
+                    config::DependentVersion::Fix => {
+                        if !dep.req.matches(&version) {
+                            let new_req = version::set_requirement(&dep.req, &version)?;
+                            if let Some(new_req) = new_req {
+                                if dry_run {
+                                    println!(
+                                        "Fixing {}'s dependency on {} to `{}` (from `{}`)",
+                                        dep_pkg.name, pkg.meta.name, new_req, dep.req
+                                    );
+                                } else {
+                                    cargo::set_dependency_version(
+                                        &dep_pkg.manifest_path,
+                                        &pkg.meta.name,
+                                        &new_req,
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                    config::DependentVersion::Upgrade => {
+                        let new_req = version::set_requirement(&dep.req, &version)?;
+                        if let Some(new_req) = new_req {
+                            if dry_run {
+                                println!(
+                                    "Upgrading {}'s dependency on {} to `{}` (from `{}`)",
+                                    dep_pkg.name, pkg.meta.name, new_req, dep.req
+                                );
+                            } else {
+                                cargo::set_dependency_version(
+                                    &dep_pkg.manifest_path,
+                                    &pkg.meta.name,
+                                    &new_req,
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+            if dependents_failed {
+                return Ok(110);
+            }
             cargo::update_lock(&pkg.manifest_path)?;
         }
         let commit_msg = replace_in(pkg.config.pro_release_commit_message(), &replacements);
