@@ -68,18 +68,14 @@ pub fn wait_for_publish(
         let index = crates_index::Index::new_cargo_default();
         let mut logged = false;
         loop {
-            match index.update() {
-                Err(e) => {
-                    log::debug!("Crate index update failed with {}", e);
-                }
-                _ => (),
+            if let Err(e) = index.update() {
+                log::debug!("Crate index update failed with {}", e);
             }
             let crate_data = index.crate_(name);
             let published = crate_data
                 .iter()
                 .flat_map(|c| c.versions().iter())
-                .find(|v| v.version() == version)
-                .is_some();
+                .any(|v| v.version() == version);
 
             if published {
                 break;
@@ -132,38 +128,31 @@ pub fn set_dependency_version(
     {
         let manifest = load_from_file(manifest_path)?;
         let mut manifest: toml_edit::Document = manifest.parse().map_err(FatalError::from)?;
-        for key in &["dependencies", "dev-dependencies", "build-dependencies"] {
-            if manifest.as_table().contains_key(key)
-                && manifest[key]
-                    .as_table()
-                    .expect("manifest is already verified")
-                    .contains_key(name)
+
+        let dep_table_names = &["dependencies", "dev-dependencies", "build-dependencies"];
+        for key in dep_table_names {
+            if let Some(deps_table) = manifest
+                .as_table_mut()
+                .get_mut(key)
+                .and_then(|i| i.as_table_mut())
             {
-                manifest[key][name]["version"] = toml_edit::value(version);
+                set_version(deps_table, name, version)?;
             }
         }
 
-        if manifest.as_table().contains_table("target") {
-            for target_cfg in manifest["target"]
-                .as_table()
-                .expect("manifest is already verified")
-                .iter()
-                // This map + collect breaks the borrow on manifest, letting us mutate in the loop.
-                .map(|(k, _)| k.to_owned())
-                .collect::<Vec<_>>()
-            {
-                for key in &["dependencies", "dev-dependencies", "build-dependencies"] {
-                    let target_table = manifest["target"][&target_cfg]
-                        .as_table()
-                        .expect("manifest is already verified");
-                    if target_table.contains_key(key)
-                        && target_table[key]
-                            .as_table()
-                            .expect("manifest is already verified")
-                            .contains_key(name)
+        if let Some(target_table) = manifest
+            .as_table_mut()
+            .get_mut("target")
+            .and_then(|i| i.as_table_mut())
+        {
+            for (_target_name, target_specific_item) in target_table.iter_mut() {
+                for key in dep_table_names {
+                    if let Some(deps_table) = target_specific_item
+                        .as_table_mut()
+                        .and_then(|t| t.get_mut(key))
+                        .and_then(|i| i.as_table_mut())
                     {
-                        manifest["target"][&target_cfg][key][name]["version"] =
-                            toml_edit::value(version);
+                        set_version(deps_table, name, version)?;
                     }
                 }
             }
@@ -179,6 +168,28 @@ pub fn set_dependency_version(
     Ok(())
 }
 
+fn set_version(
+    deps_table: &mut toml_edit::Table,
+    name: &str,
+    version: &str,
+) -> Result<(), FatalError> {
+    let dep_item = match deps_table.get_mut(name) {
+        Some(item) => item,
+        None => {
+            return Ok(());
+        }
+    };
+    if dep_item.is_table_like() {
+        dep_item["version"] = toml_edit::value(version);
+    } else {
+        return Err(FatalError::InvalidCargoFileFormat(
+            "Intra-workspace dependencies should use both version and path".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 pub fn update_lock(manifest_path: &Path) -> Result<(), FatalError> {
     cargo_metadata::MetadataCommand::new()
         .manifest_path(manifest_path)
@@ -189,7 +200,7 @@ pub fn update_lock(manifest_path: &Path) -> Result<(), FatalError> {
 }
 
 pub fn parse_cargo_config(manifest_path: &Path) -> Result<Value, FatalError> {
-    let cargo_file_content = load_from_file(&manifest_path).map_err(FatalError::from)?;
+    let cargo_file_content = load_from_file(manifest_path).map_err(FatalError::from)?;
     cargo_file_content.parse().map_err(FatalError::from)
 }
 
@@ -204,7 +215,6 @@ fn load_from_file(path: &Path) -> io::Result<String> {
 mod test {
     use super::*;
 
-    use assert_fs;
     #[allow(unused_imports)] // Not being detected
     use assert_fs::prelude::*;
     use predicates::prelude::*;
@@ -477,6 +487,82 @@ mod test {
 
     [dev-dependencies]
     foo = { version = "2.0", path = "../" }
+    "#,
+                )
+                .from_utf8()
+                .from_file_path(),
+            );
+
+            temp.close().unwrap();
+        }
+
+        #[test]
+        fn no_path() {
+            let temp = assert_fs::TempDir::new().unwrap();
+            temp.copy_from("tests/fixtures/simple", &["**"]).unwrap();
+            let manifest_path = temp.child("Cargo.toml");
+            manifest_path
+                .write_str(
+                    r#"
+    [package]
+    name = "t"
+    version = "0.1.0"
+    authors = []
+    edition = "2018"
+
+    [build-dependencies]
+
+    [dependencies]
+    foo = "1.0"
+    "#,
+                )
+                .unwrap();
+
+            let err = set_dependency_version(manifest_path.path(), "foo", "2.0");
+            assert!(err.is_err());
+
+            temp.close().unwrap();
+        }
+
+        #[test]
+        fn out_of_line_table() {
+            let temp = assert_fs::TempDir::new().unwrap();
+            temp.copy_from("tests/fixtures/simple", &["**"]).unwrap();
+            let manifest_path = temp.child("Cargo.toml");
+            manifest_path
+                .write_str(
+                    r#"
+    [package]
+    name = "t"
+    version = "0.1.0"
+    authors = []
+    edition = "2018"
+
+    [build-dependencies]
+
+    [dependencies.foo]
+    version = "1.0"
+    path = "../"
+    "#,
+                )
+                .unwrap();
+
+            set_dependency_version(manifest_path.path(), "foo", "2.0").unwrap();
+
+            manifest_path.assert(
+                predicate::str::similar(
+                    r#"
+    [package]
+    name = "t"
+    version = "0.1.0"
+    authors = []
+    edition = "2018"
+
+    [build-dependencies]
+
+    [dependencies.foo]
+    version = "2.0"
+    path = "../"
     "#,
                 )
                 .from_utf8()

@@ -4,9 +4,30 @@
 
 ## [Unreleased] - ReleaseDate
 
+## [0.16.1] - 2021-07-04
+
+### Fixed 
+
+* Submodule operation dir issue
+
+## [0.16.0] - 2021-07-03
+
+### Added
+
+* Git dirty check for submodules
+
+### Changed
+
+* Prior sharing of pushes between workspace crates is now behind the flag `consolidate-pushes`
+
+### Fixed
+
+* Avoid panic on invalid Cargo.toml entry
+
 ## [0.15.1] - 2021-06-24
 
 ### Fixed
+
 * Fixed issue where the versions of cfg specific dependencies wouldn't be properly bumped.
 
 ## [0.15.0] - 2021-06-19
